@@ -3,27 +3,27 @@ const DASHBOARD_PASSWORD = "CHANGE_ME_TO_YOUR_OWN_PASSWORD";
 // Default number of configs to take from each group per rotation round (can be changed in the UI)
 const DEFAULT_ROTATION_CHUNK = 3;
 
-// Initial configurations if database is empty
+// Default subscription name shown by apps (editable from the dashboard)
+const DEFAULT_SUB_TITLE = 'Subscription Hub';
+
+// Initial entries if the database is empty
 const defaultGroups = {
   "Germany_Server": {
     mode: "configs",
     configs: [
-      "vless://example-de-1@1.1.1.1:443?type=ws"
+      "example://sample-1@192.0.2.1:443"
     ],
     subUrls: [],
     cachedSubConfigs: []
   }
 };
 
-// Any "scheme://" at the start of a line begins a NEW entry (this is what keeps configs from being glued together)
+// Any "scheme://" at the start of a line begins a NEW entry (this is what keeps entries from being glued together)
 const SCHEME_LINE_RE = /^[a-z][a-z0-9+.\-]*:\/\//i;
 
-// Protocols that are treated as proxy configs
-const KNOWN_PROTOCOLS = new Set([
-  'vless', 'vmess', 'trojan', 'ss', 'ssr',
-  'hysteria2', 'hy2', 'hysteria', 'tuic',
-  'wireguard', 'wg', 'socks', 'socks5', 'anytls', 'juicity'
-]);
+// User-Agent sent when fetching remote subscription links.
+// Optional: add a text variable named SUB_FETCH_UA in the Worker settings to override it.
+const FETCH_UA = (typeof SUB_FETCH_UA !== 'undefined' && SUB_FETCH_UA) ? String(SUB_FETCH_UA) : 'SubHub/1.0';
 
 addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request))
@@ -34,7 +34,7 @@ addEventListener('fetch', event => {
 /* ------------------------------------------------------------------ */
 
 async function getAuthToken() {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('vpn-hub:' + DASHBOARD_PASSWORD));
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('sub-hub:' + DASHBOARD_PASSWORD));
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -69,10 +69,12 @@ async function handleRequest(request) {
     (url.pathname === '/sub' && url.searchParams.get('key') === subToken) ||
     url.searchParams.get('raw') === subToken;
 
-  // 1. ONLY ALLOW THE VPN APP TO FETCH CONFIGS WITH THE SECRET 6-DIGIT SUBSCRIPTION CODE
+  // 1. ONLY ALLOW THE CLIENT APP TO FETCH THE LIST WITH THE SECRET 6-DIGIT SUBSCRIPTION CODE
   if (isProtectedSubMatch) {
     let serverGroups = await envFetchGroups();
     let rotationChunk = await envFetchRotationChunk();
+
+    const subTitle = await envFetchSubTitle();
 
     // Optional query override e.g. /sub/123456?chunk=5
     if (url.searchParams.has('chunk')) {
@@ -125,7 +127,7 @@ async function handleRequest(request) {
 
     if (kvCacheUpdated) {
       try {
-        await VPN_DB.put("server_groups", JSON.stringify(serverGroups));
+        await STORE.put("server_groups", JSON.stringify(serverGroups));
       } catch (e) {}
     }
 
@@ -160,7 +162,7 @@ async function handleRequest(request) {
         'content-type': 'text/plain; charset=utf-8',
         'Cache-Control': 'no-store, no-cache, must-revalidate',
         'Access-Control-Allow-Origin': '*',
-        'Profile-Title': btoa(unescape(encodeURIComponent('VPN Subscription Hub'))),
+        'Profile-Title': 'base64:' + btoa(unescape(encodeURIComponent(subTitle))),
         'Profile-Update-Interval': '12'
       },
     });
@@ -248,14 +250,18 @@ async function handleRequest(request) {
         // Keep the order the user arranged in the UI
         const orderedGroups = {};
         groupKeys.forEach(k => { orderedGroups[k] = normalizedGroups[k]; });
-        await VPN_DB.put("server_groups", JSON.stringify(orderedGroups));
+        await STORE.put("server_groups", JSON.stringify(orderedGroups));
       }
       if (data && data.rotationChunk !== undefined) {
         const parsedChunk = Math.max(1, parseInt(data.rotationChunk, 10) || DEFAULT_ROTATION_CHUNK);
-        await VPN_DB.put("rotation_chunk", String(parsedChunk));
+        await STORE.put("rotation_chunk", String(parsedChunk));
       }
       if (data && typeof data.subToken === 'string' && /^\d{6}$/.test(data.subToken)) {
-        await VPN_DB.put("sub_token", data.subToken);
+        await STORE.put("sub_token", data.subToken);
+      }
+      if (data && typeof data.subTitle === 'string') {
+        const cleanTitle = data.subTitle.trim().slice(0, 100) || DEFAULT_SUB_TITLE;
+        await STORE.put("sub_title", cleanTitle);
       }
       const latestGroups = await envFetchGroups();
       return new Response(JSON.stringify({ success: true, groups: latestGroups }), { headers: { 'content-type': 'application/json' } });
@@ -268,7 +274,7 @@ async function handleRequest(request) {
   if (request.method === 'POST' && url.pathname === '/regenerate-token') {
     try {
       const newToken = generateSixDigitCode();
-      await VPN_DB.put("sub_token", newToken);
+      await STORE.put("sub_token", newToken);
       return new Response(JSON.stringify({ success: true, subToken: newToken }), {
         headers: { 'content-type': 'application/json' }
       });
@@ -280,7 +286,8 @@ async function handleRequest(request) {
   // If logged in, safely render Graphic Interface Panel
   let serverGroups = await envFetchGroups();
   let rotationChunk = await envFetchRotationChunk();
-  return new Response(getAdminPanelHTML(url.origin, serverGroups, rotationChunk, subToken), {
+  const adminTitle = await envFetchSubTitle();
+  return new Response(getAdminPanelHTML(url.origin, serverGroups, rotationChunk, subToken, adminTitle), {
     headers: { 'content-type': 'text/html; charset=utf-8' }
   });
 }
@@ -299,12 +306,14 @@ function getScheme(str) {
   return m ? m[1].toLowerCase() : '';
 }
 
-function isKnownProtocolLine(str) {
-  return KNOWN_PROTOCOLS.has(getScheme(str));
+// Any "scheme://" line that is not a plain web link counts as an entry
+function isEntryLine(str) {
+  const s = String(str || '').trim();
+  return SCHEME_LINE_RE.test(s) && !isHttpUrl(s);
 }
 
 // Splits text into entries. A line that starts with ANY "scheme://" is always a new entry,
-// so an unrecognised scheme can never be glued onto the previous config.
+// so an unrecognised scheme can never be glued onto the previous entry.
 // Only lines that look like a wrapped continuation (no scheme, no whitespace) are stitched.
 function splitNonEmptyLines(text) {
   const rawLines = String(text || '')
@@ -323,7 +332,7 @@ function splitNonEmptyLines(text) {
       !line.startsWith(';') &&
       !line.startsWith('#')
     ) {
-      // Stitch wrapped continuation lines (common with long IPv6 config URLs)
+      // Stitch wrapped continuation lines (common with long IPv6 URLs)
       stitched[stitched.length - 1] += line;
     }
   }
@@ -345,14 +354,14 @@ function decodeSubscriptionPayload(rawBody) {
   const trimmed = String(rawBody || '').trim();
   if (!trimmed) return [];
 
-  const directLines = splitNonEmptyLines(trimmed).filter(l => isKnownProtocolLine(l));
+  const directLines = splitNonEmptyLines(trimmed).filter(l => isEntryLine(l));
   if (directLines.length > 0) {
     return directLines;
   }
 
   try {
     const decoded = safeBase64Decode(trimmed);
-    const decodedLines = splitNonEmptyLines(decoded).filter(l => isKnownProtocolLine(l));
+    const decodedLines = splitNonEmptyLines(decoded).filter(l => isEntryLine(l));
     if (decodedLines.length > 0) {
       return decodedLines;
     }
@@ -370,7 +379,7 @@ async function fetchAndDecodeSubUrls(urls) {
       const res = await fetch(cleanUrl, {
         method: 'GET',
         headers: {
-          'User-Agent': 'v2rayNG/1.8.19',
+          'User-Agent': FETCH_UA,
           'Accept': '*/*'
         }
       });
@@ -449,12 +458,12 @@ function generateSixDigitCode() {
 
 async function envFetchOrCreateSubToken() {
   try {
-    const existing = await VPN_DB.get("sub_token");
+    const existing = await STORE.get("sub_token");
     if (existing && /^\d{6}$/.test(existing.trim())) {
       return existing.trim();
     }
     const generated = generateSixDigitCode();
-    await VPN_DB.put("sub_token", generated);
+    await STORE.put("sub_token", generated);
     return generated;
   } catch (e) {
     return "482915";
@@ -500,70 +509,80 @@ function splitHostPort(hostPort) {
   return { host: hp, port: '' };
 }
 
-// Parses out the host, normalises unbracketed IPv6 so VPN clients don't drop it,
-// and injects the custom group name as the config remark.
+// Parses out the host, normalises unbracketed IPv6 so clients don't drop it,
+// and injects the custom group name as the entry label.
+// Scheme-agnostic: handles URL-style entries (user@host:port?...), encoded-JSON bodies,
+// and legacy encoded "user:secret@host:port" bodies.
 function renameConfigWithIP(config, groupName) {
   try {
     const rawConfig = String(config || '').trim();
     const scheme = getScheme(rawConfig);
+    if (!scheme || scheme === 'http' || scheme === 'https') return config;
 
-    if (scheme === 'vmess') {
-      const hashIdx = rawConfig.indexOf('#');
-      const b64Body = (hashIdx !== -1 ? rawConfig.slice(8, hashIdx) : rawConfig.slice(8)).trim();
-      const decoded = safeBase64Decode(b64Body);
-      const configObj = JSON.parse(decoded);
-      const rawHost = String(configObj.add || configObj.host || "Unknown_IP").trim();
-      const ipAddress = rawHost.replace(/^\[|\]$/g, '');
-      configObj.ps = `${groupName} - ${ipAddress}`;
-      return `vmess://${btoa(unescape(encodeURIComponent(JSON.stringify(configObj))))}`;
-    }
+    const tryDecode = (s) => {
+      try { return safeBase64Decode(s); } catch (e) { return null; }
+    };
 
-    if (scheme && KNOWN_PROTOCOLS.has(scheme)) {
-      const hashIndex = rawConfig.indexOf('#');
-      let basePart = hashIndex !== -1 ? rawConfig.substring(0, hashIndex) : rawConfig;
-      let ipAddress = "Unknown_IP";
+    const hashIndex = rawConfig.indexOf('#');
+    let basePart = hashIndex !== -1 ? rawConfig.substring(0, hashIndex) : rawConfig;
+    let ipAddress = "Unknown_IP";
 
-      const schemeEnd = basePart.indexOf('://') + 3;
-      const qIndex = basePart.indexOf('?', schemeEnd);
-      const pathIndex = basePart.indexOf('/', schemeEnd);
-      let authorityEnd = basePart.length;
-      if (qIndex !== -1 && qIndex < authorityEnd) authorityEnd = qIndex;
-      if (pathIndex !== -1 && pathIndex < authorityEnd) authorityEnd = pathIndex;
+    const schemeEnd = basePart.indexOf('://') + 3;
+    const body = basePart.slice(schemeEnd).trim();
 
-      const authorityPart = basePart.slice(0, authorityEnd);
-      const restPart = basePart.slice(authorityEnd);
-      const atIndex = authorityPart.lastIndexOf('@');
-
-      if (atIndex !== -1) {
-        const prefix = authorityPart.slice(0, atIndex + 1);
-        const hostPort = authorityPart.slice(atIndex + 1);
-        const parsed = splitHostPort(hostPort);
-        if (parsed.host) {
-          ipAddress = parsed.host;
-          const isV6 = parsed.host.indexOf(':') !== -1;
-          const hostOut = isV6 ? `[${parsed.host}]` : parsed.host;
-          basePart = `${prefix}${hostOut}${parsed.port ? ':' + parsed.port : ''}${restPart}`;
-        }
-      } else if (scheme === 'ss') {
-        // Legacy ss:// with the whole authority base64-encoded
-        const body = authorityPart.slice(5);
-        const decoded = safeBase64Decode(body);
-        const atInDecoded = decoded.lastIndexOf('@');
-        if (atInDecoded !== -1) {
-          const parsed = splitHostPort(decoded.slice(atInDecoded + 1));
-          if (parsed.host) ipAddress = parsed.host;
-        }
+    // Encoded JSON body (no "@" anywhere): set the label field inside the JSON itself
+    if (body && body.indexOf('@') === -1) {
+      const decodedBody = tryDecode(body);
+      let configObj = null;
+      if (decodedBody !== null) {
+        try { configObj = JSON.parse(decodedBody); } catch (e) { configObj = null; }
       }
-
-      return `${basePart}#${encodeURIComponent(`${groupName} - ${ipAddress}`)}`;
+      if (configObj && typeof configObj === 'object' && !Array.isArray(configObj)) {
+        const rawHost = String(configObj.add || configObj.host || "Unknown_IP").trim();
+        const host = rawHost.replace(/^\[|\]$/g, '');
+        configObj.ps = `${groupName} - ${host}`;
+        return `${scheme}://${btoa(unescape(encodeURIComponent(JSON.stringify(configObj))))}`;
+      }
     }
+
+    const qIndex = basePart.indexOf('?', schemeEnd);
+    const pathIndex = basePart.indexOf('/', schemeEnd);
+    let authorityEnd = basePart.length;
+    if (qIndex !== -1 && qIndex < authorityEnd) authorityEnd = qIndex;
+    if (pathIndex !== -1 && pathIndex < authorityEnd) authorityEnd = pathIndex;
+
+    const authorityPart = basePart.slice(0, authorityEnd);
+    const restPart = basePart.slice(authorityEnd);
+    const atIndex = authorityPart.lastIndexOf('@');
+
+    if (atIndex !== -1) {
+      const prefix = authorityPart.slice(0, atIndex + 1);
+      const hostPort = authorityPart.slice(atIndex + 1);
+      const parsed = splitHostPort(hostPort);
+      if (parsed.host) {
+        ipAddress = parsed.host;
+        const isV6 = parsed.host.indexOf(':') !== -1;
+        const hostOut = isV6 ? `[${parsed.host}]` : parsed.host;
+        basePart = `${prefix}${hostOut}${parsed.port ? ':' + parsed.port : ''}${restPart}`;
+      }
+    } else {
+      // Legacy form: the whole authority is encoded ("user:secret@host:port")
+      const decodedAuthority = tryDecode(authorityPart.slice(schemeEnd));
+      const atInDecoded = decodedAuthority !== null ? decodedAuthority.lastIndexOf('@') : -1;
+      if (atInDecoded !== -1) {
+        const parsed = splitHostPort(decodedAuthority.slice(atInDecoded + 1));
+        if (parsed.host) ipAddress = parsed.host;
+      }
+    }
+
+    return `${basePart}#${encodeURIComponent(`${groupName} - ${ipAddress}`)}`;
   } catch (err) {}
   return config;
 }
 
 async function envFetchGroups() {
   try {
-    const kvData = await VPN_DB.get("server_groups");
+    const kvData = await STORE.get("server_groups");
     if (kvData) {
       const parsed = JSON.parse(kvData);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length > 0) {
@@ -574,9 +593,17 @@ async function envFetchGroups() {
   return normalizeAllGroups(defaultGroups);
 }
 
+async function envFetchSubTitle() {
+  try {
+    const t = await STORE.get("sub_title");
+    if (t && t.trim()) return t.trim();
+  } catch (e) {}
+  return DEFAULT_SUB_TITLE;
+}
+
 async function envFetchRotationChunk() {
   try {
-    const kvChunk = await VPN_DB.get("rotation_chunk");
+    const kvChunk = await STORE.get("rotation_chunk");
     if (kvChunk) {
       const n = parseInt(kvChunk, 10);
       if (Number.isFinite(n) && n >= 1) return n;
@@ -695,9 +722,10 @@ function getLoginPageHTML() {
 /* MAIN DASHBOARD                                                      */
 /* ------------------------------------------------------------------ */
 
-function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
+function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken, subTitle) {
   const safeGroupsJson = JSON.stringify(normalizeAllGroups(serverGroups)).replace(/</g, '\\u003c');
   const safeChunk = Number(rotationChunk) >= 1 ? Number(rotationChunk) : DEFAULT_ROTATION_CHUNK;
+  const safeTitleJson = JSON.stringify(String(subTitle || DEFAULT_SUB_TITLE)).replace(/</g, '\\u003c');
   const safeSubToken = String(subToken || '482915').replace(/[^0-9]/g, '').slice(0, 6) || '482915';
 
   return `
@@ -707,7 +735,7 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex,nofollow">
-    <title>VPN Subscription Hub</title>
+    <title>Subscription Hub</title>
     <style>
         :root {
             --bg: #0b0c10;
@@ -1035,6 +1063,14 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
             </div>
         </div>
 
+        <div class="card">
+            <div class="card-title">Subscription name</div>
+            <div class="card-desc">Shown by apps as the name of the subscription (sent in the Profile-Title header). Apps update it on the next refresh.</div>
+            <div class="sub-url-row">
+                <input type="text" id="subTitleInput" maxlength="100" placeholder="Subscription name" oninput="onSubTitleInput(this.value)" style="width:100%;background:transparent;border:none;color:#fff;font-size:14px;font-family:inherit;padding:4px 2px;outline:none;">
+            </div>
+        </div>
+
         <div class="card" id="divideCard">
             <div class="divide-top">
                 <div>
@@ -1060,7 +1096,7 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
                 <span class="sub-status-text" id="previewSummary"></span>
             </div>
             <div class="preview-body">
-                <div class="preview-legend">Each pill is one batch in the exact order your VPN app will list them. A dashed amber outline means that group had fewer configs left than the batch size (its last, partial batch).</div>
+                <div class="preview-legend">Each pill is one batch in the exact order your app will list them. A dashed amber outline means that group had fewer configs left than the batch size (its last, partial batch).</div>
                 <div class="batches" id="batches"></div>
             </div>
         </div>
@@ -1096,6 +1132,7 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
         let dataGroups = ${safeGroupsJson};
         let currentRotationChunk = ${safeChunk};
         let currentSubToken = ${JSON.stringify(safeSubToken)};
+        let currentSubTitle = ${safeTitleJson};
         let dragFromIndex = null;
         let dropPosition = null;
         let hasUnsavedChanges = false;
@@ -1223,6 +1260,11 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
             }
             const floatingChunk = document.getElementById('floatingChunkText');
             if (floatingChunk) floatingChunk.textContent = 'Divide: ' + currentRotationChunk + '/group';
+        }
+
+        function onSubTitleInput(val) {
+            currentSubTitle = String(val || '');
+            markDirty(true);
         }
 
         function togglePreview() {
@@ -1588,7 +1630,7 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
             if (names.length === 0) {
                 const emptyBox = document.createElement('div');
                 emptyBox.className = 'empty-groups-state';
-                emptyBox.innerHTML = '<div style="margin-bottom: 14px; font-size: 14px;">No server groups yet. Add your first group to paste V2Ray configs or subscription links.</div><button class="btn" onclick="addNewGroup()">+ Add Server Group</button>';
+                emptyBox.innerHTML = '<div style="margin-bottom: 14px; font-size: 14px;">No server groups yet. Add your first group to paste entries or subscription links.</div><button class="btn" onclick="addNewGroup()">+ Add Server Group</button>';
                 container.appendChild(emptyBox);
                 updateAllCounts();
                 return;
@@ -1727,7 +1769,7 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
                 subStatus.className = 'sub-status-text' + (entry.cachedSubConfigs.length > 0 ? ' ok' : '');
                 subStatus.textContent = entry.cachedSubConfigs.length > 0
                     ? ('Synced ' + entry.cachedSubConfigs.length + (entry.cachedSubConfigs.length === 1 ? ' config' : ' configs'))
-                    : 'Fetched live when your VPN updates, or on save';
+                    : 'Fetched live when your app updates, or on save';
 
                 const syncSubBtn = document.createElement('button');
                 syncSubBtn.type = 'button';
@@ -1744,7 +1786,7 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
                 const cfgArea = document.createElement('textarea');
                 cfgArea.className = 'configs-textarea';
                 cfgArea.spellcheck = false;
-                cfgArea.placeholder = 'Paste configurations here (vless://, vmess://, trojan://, ss://, hy2:// \\u2014 one per line)\\u2026';
+                cfgArea.placeholder = 'Paste entries here, one per line\\u2026';
                 cfgArea.value = entry.configs.join(NEWLINE_CHAR);
                 cfgArea.style.display = entry.mode === 'configs' ? 'block' : 'none';
                 cfgArea.addEventListener('input', function() { updateAllCounts(); markDirty(true); });
@@ -1955,7 +1997,7 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
                 const response = await fetch('/save', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ groups: dataGroups, rotationChunk: currentRotationChunk, subToken: currentSubToken })
+                    body: JSON.stringify({ groups: dataGroups, rotationChunk: currentRotationChunk, subToken: currentSubToken, subTitle: currentSubTitle })
                 });
                 const result = await response.json();
                 if (result.success) {
@@ -2006,6 +2048,7 @@ function getAdminPanelHTML(baseUrl, serverGroups, rotationChunk, subToken) {
             if (hasUnsavedChanges) { e.preventDefault(); e.returnValue = ''; }
         });
 
+        document.getElementById('subTitleInput').value = currentSubTitle;
         updateChunkUI();
         renderGroups();
     </script>
