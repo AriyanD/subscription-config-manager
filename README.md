@@ -4,11 +4,11 @@ A self-hosted V2Ray/Xray subscription aggregator for Cloudflare Workers. It prov
 
 **Documentation:** [فارسی / راهنمای فارسی](README.fa.md)
 
-## Interface preview
+## Dashboard screenshot
 
-![VPN Subscription Hub dashboard preview](assets/interface-preview.png)
+![Subscription Hub dashboard screenshot](assets/dashboard-screenshot.svg)
 
-*This is an illustrative interface preview, not a screenshot captured from a live deployment.*
+*Dashboard screenshot generated from the project's interface code using demonstration server groups and sample configuration counts. No real subscription URLs, credentials, or server addresses are shown.*
 
 The project is a single Cloudflare Worker script (`worker.js`) with no npm runtime dependencies. Cloudflare Workers KV stores the group configuration, rotation setting, subscription token, and cached upstream configurations.
 
