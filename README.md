@@ -6,7 +6,7 @@ A self-hosted V2Ray/Xray subscription aggregator for Cloudflare Workers. It prov
 
 ## Dashboard screenshot
 
-![Subscription Hub dashboard screenshot](assets/dashboard-screenshot.svg)
+![Subscription Hub dashboard screenshot](assets/interface-preview.png)
 
 *Dashboard screenshot generated from the project's interface code using demonstration server groups and sample configuration counts. No real subscription URLs, credentials, or server addresses are shown.*
 
