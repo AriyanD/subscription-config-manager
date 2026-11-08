@@ -1,5 +1,7 @@
 # 🛡️ Subscription Hub (Config Manager)
 
+[**🇬🇧 English**](README.md) | [**🇮🇷 مطالعه نسخه فارسی (Persian)**](README.fa.md)
+
 A single-file, zero-dependency **Cloudflare Worker** that lets you organize, group, rotate, and publish V2Ray / Xray / Clash proxy configurations and remote subscription links through a hardened, ergonomic web dashboard.
 
 ![Subscription Hub Dashboard](screenshot.png)
@@ -9,22 +11,22 @@ A single-file, zero-dependency **Cloudflare Worker** that lets you organize, gro
 ## ✨ Key Features
 
 ### 🔄 Smart Round-Robin Rotation & Renaming
-* **Balanced Batch Rotation:** Instead of dumping all configs from one server group before moving to the next, Subscription Hub interleaves them in customizable rounds (`1`, `2`, `3`, `5`, `10`, or any custom number from `1–500`).
+* **Balanced Batch Rotation:** Instead of listing all configs from one server group before moving to the next, Subscription Hub interleaves them in customizable rounds (`1`, `2`, `3`, `5`, `10`, or any custom number from `1–500`).
 * **Visual Output Preview:** Inspect the exact batch sequence (including partial final batches) directly in the dashboard before saving.
 * **Automatic Config Renaming:** Automatically rewrites remarks/names to `<Group Name> - <IP or Host>` across URL-based schemes (`vless://`, `trojan://`, `ss://`, `tuic://`, `hysteria2://`, etc.) and Base64-JSON schemes (`vmess://`), with full support for IPv4, domains, and bracketed/unbracketed IPv6.
 
 ### 🔗 Automatic Subscription Syncing
-* **Live Sync on Client App Refresh:** Every time your proxy client app (v2rayNG, Streisand, Hiddify, Clash, etc.) updates your hub link, the Worker automatically fetches fresh configs from all active remote subscription URLs and updates its KV cache.
+* **Live Sync on Client App Refresh:** Every time your proxy client app (v2rayNG, Streisand, Hiddify, v2rayN, Clash, etc.) updates your hub link, the Worker automatically fetches fresh configs from all active remote subscription URLs and updates its KV cache.
 * **Optional Scheduled Background Sync (`Off` / `Daily` / `Weekly`):** Choose whether to run background syncs on a daily or weekly schedule using Cloudflare Cron Triggers—controllable directly from the dashboard UI.
 * **Resilient Fallback Cache:** If a third-party subscription server is temporarily unreachable when your client updates, Subscription Hub seamlessly serves the last known good `cachedSubConfigs` from KV.
-* **One-Click "Sync All Links" & Timestamps:** Manually trigger a bulk sync across all subscription groups at once and see relative sync timestamps (`Synced 14 configs • 5m ago`).
+* **One-Click "Sync All Links" & Timestamps:** Manually trigger a bulk sync across all subscription groups at once and view relative sync timestamps (`Synced 14 configs • 5m ago`).
 
 ### 🧠 Cognitive Ergonomics & Dashboard UX
 * **Active / Paused Group Toggle:** Temporarily mute a server group from your published subscription without deleting its configs or losing its position.
 * **Smart Paste (Auto-Base64 Decode & Mode Detection):**
   * Paste a raw Base64-encoded subscription block into **Direct configs** and it automatically decodes into individual config lines.
   * Paste `https://` links into **Direct configs** and get a one-click prompt to switch the group to **Subscription link** mode and sync immediately.
-* **Instant Search & Protocol Chips:** Filter groups in real time by group name, protocol (`vless`, `vmess`, `ipv6`), or status (`active`, `paused`). Each group automatically displays protocol count badges, IPv6 indicators, unrecognized-line warnings, and a one-click duplicate remover.
+* **Instant Search & Protocol Chips:** Filter groups in real time by group name, protocol (`vless`, `vmess`, `ipv6`), or status (`active`, `paused`). Each group displays protocol count badges, IPv6 indicators, unrecognized-line warnings, and a one-click duplicate remover.
 * **Built-in Offline QR Code & Plain Preview:** Generate a scannable SVG QR code for mobile apps with zero external requests, or inspect the unencoded output in your browser with one click (`?format=plain`).
 * **Drag-and-Drop & Undoable Actions:** Reorder groups via drag handles or arrow buttons, insert new groups between existing ones, and undo accidental group deletions via toast notifications.
 * **Custom Themes:** Follows your OS light/dark preference by default, or customize Background, Group, and Button colors (with Light, Dark, Sand, and Mint presets).
