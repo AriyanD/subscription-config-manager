@@ -6,6 +6,8 @@
  *   2. Set your dashboard password in DASHBOARD_PASSWORD below (min 10 characters).
  *      (Optional, safer: a Secret named ADMIN_PASSWORD overrides it.)
  *   3. Optional text variable: SUB_FETCH_UA  (User-Agent for remote fetches)
+ *   4. Optional Cron Trigger (e.g. "0 * * * *") if you enable Daily/Weekly
+ *      scheduled background sync in the dashboard UI.
  * ==================================================================== */
 
 const DASHBOARD_PASSWORD = "CHANGE_ME_TO_YOUR_OWN_PASSWORD";
@@ -18,15 +20,20 @@ const DEFAULT_ROTATION_CHUNK = 3;
 // Default subscription name shown by apps (editable in the dashboard)
 const DEFAULT_SUB_TITLE = 'Subscription Hub';
 
+// Default scheduled auto-sync mode: 'off' | 'daily' | 'weekly'
+const DEFAULT_AUTO_SYNC = 'off';
+
 // Initial entries if the database has never been saved
 const defaultGroups = {
   "Germany_Server": {
     mode: "configs",
+    enabled: true,
     configs: [
       "example://sample-1@192.0.2.1:443"
     ],
     subUrls: [],
-    cachedSubConfigs: []
+    cachedSubConfigs: [],
+    lastSynced: 0
   }
 };
 
@@ -44,13 +51,20 @@ const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 10000;
 const MAX_REMOTE_BYTES = 3 * 1024 * 1024;
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_MS = 7 * DAY_MS;
+
 // Any "scheme://" at the start of a line begins a NEW entry
 const SCHEME_LINE_RE = new RegExp('^[a-z][a-z0-9+.-]*://', 'i');
 
 const FETCH_UA = (typeof SUB_FETCH_UA !== 'undefined' && SUB_FETCH_UA) ? String(SUB_FETCH_UA) : 'SubHub/1.0';
 
 addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
+  event.respondWith(handleRequest(event.request, event));
+});
+
+addEventListener('scheduled', event => {
+  event.waitUntil(handleScheduledSync(false));
 });
 
 /* ------------------------------------------------------------------ */
@@ -204,16 +218,16 @@ async function readJson(request) {
 /* Request handler                                                     */
 /* ------------------------------------------------------------------ */
 
-async function handleRequest(request) {
+async function handleRequest(request, event) {
   try {
-    return await route(request);
+    return await route(request, event);
   } catch (e) {
     if (e instanceof HttpError) return jsonResponse({ success: false, error: e.message }, e.status);
     return textResponse('Something went wrong. Please try again.', 500);
   }
 }
 
-async function route(request) {
+async function route(request, event) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
@@ -253,6 +267,7 @@ async function route(request) {
       return jsonResponse({ success: true }, 200, { 'Set-Cookie': sessionCookie('', 0) });
     }
     if (path === '/fetch-sub') return handleFetchSub(request);
+    if (path === '/sync-all') return handleSyncAll();
     if (path === '/save') return handleSave(request);
     if (path === '/regenerate-token') {
       const newToken = generateToken();
@@ -264,10 +279,17 @@ async function route(request) {
 
   // 4. Dashboard page
   if (path !== '/') return Response.redirect(url.origin + '/', 302);
-  const [serverGroups, rotationChunk, adminTitle, subToken, rev] = await Promise.all([
-    envFetchGroups(), envFetchRotationChunk(), envFetchSubTitle(), envFetchOrCreateSubToken(), envFetchRev()
+
+  // Also opportunistically check if a scheduled daily/weekly sync is due
+  if (event && typeof event.waitUntil === 'function') {
+    event.waitUntil(handleScheduledSync(false));
+  }
+
+  const [serverGroups, rotationChunk, adminTitle, subToken, rev, autoSync, lastAutoSync] = await Promise.all([
+    envFetchGroups(), envFetchRotationChunk(), envFetchSubTitle(), envFetchOrCreateSubToken(),
+    envFetchRev(), envFetchAutoSync(), envFetchLastAutoSync()
   ]);
-  return htmlResponse(nonce => getAdminPanelHTML(nonce, url.origin, serverGroups, rotationChunk, subToken, adminTitle, rev), 200);
+  return htmlResponse(nonce => getAdminPanelHTML(nonce, url.origin, serverGroups, rotationChunk, subToken, adminTitle, rev, autoSync, lastAutoSync), 200);
 }
 
 /* ---------- Login with brute-force protection ---------- */
@@ -307,7 +329,7 @@ async function handleLogin(request, password) {
   }, 401);
 }
 
-/* ---------- Remote subscription preview ---------- */
+/* ---------- Remote subscription preview & bulk sync ---------- */
 
 async function handleFetchSub(request) {
   const body = await readJson(request);
@@ -321,15 +343,96 @@ async function handleFetchSub(request) {
     }, 400);
   }
   const result = await fetchAndDecodeSubUrls(validUrls);
+  const now = Date.now();
   return jsonResponse({
     success: result.configs.length > 0 || result.errors.length === 0,
     configs: result.configs.slice(0, MAX_ENTRIES_PER_GROUP),
     count: result.configs.length,
+    lastSynced: result.configs.length > 0 ? now : 0,
     errors: result.errors
   });
 }
 
-/* ---------- Save (with conflict detection) ---------- */
+async function handleSyncAll() {
+  const summary = await syncAllStoredSubGroups();
+  const latestGroups = await envFetchGroups();
+  const rev = await envFetchRev();
+  return jsonResponse({
+    success: true,
+    syncedGroups: summary.syncedGroups,
+    totalConfigs: summary.totalConfigs,
+    errors: summary.errors,
+    groups: latestGroups,
+    rev: rev
+  });
+}
+
+async function handleScheduledSync(forceRun) {
+  try {
+    const schedule = await envFetchAutoSync();
+    if (!forceRun && schedule === 'off') return;
+    const lastRun = await envFetchLastAutoSync();
+    const now = Date.now();
+    // Allow a small 30-minute buffer so daily/weekly crons don't skip due to slight drift
+    const intervalMs = schedule === 'weekly' ? (WEEK_MS - 30 * 60 * 1000) : (DAY_MS - 30 * 60 * 1000);
+    if (!forceRun && lastRun > 0 && (now - lastRun) < intervalMs) return;
+
+    await syncAllStoredSubGroups();
+    await STORE.put("last_auto_sync", String(now));
+  } catch (e) {}
+}
+
+async function syncAllStoredSubGroups() {
+  const groups = await envFetchGroups();
+  const names = Object.keys(groups);
+  const updates = {};
+  const errors = [];
+  let syncedGroups = 0;
+  let totalConfigs = 0;
+
+  await Promise.all(names.map(async (g) => {
+    const entry = normalizeGroupEntry(groups[g]);
+    if (entry.mode === 'sub' && entry.subUrls.length > 0) {
+      const res = await fetchAndDecodeSubUrls(entry.subUrls);
+      if (res.configs.length > 0) {
+        const clipped = res.configs.slice(0, MAX_ENTRIES_PER_GROUP);
+        updates[g] = {
+          subUrls: entry.subUrls,
+          configs: clipped,
+          lastSynced: Date.now()
+        };
+        syncedGroups += 1;
+        totalConfigs += clipped.length;
+      }
+      if (res.errors.length > 0) {
+        res.errors.forEach(err => errors.push(g + ': ' + err));
+      }
+    }
+  }));
+
+  if (Object.keys(updates).length > 0) {
+    try {
+      const latest = await envFetchGroups();
+      let changed = false;
+      Object.keys(updates).forEach(g => {
+        const cur = latest[g];
+        if (cur && cur.mode === 'sub' && JSON.stringify(cur.subUrls) === JSON.stringify(updates[g].subUrls)) {
+          cur.cachedSubConfigs = updates[g].configs;
+          cur.lastSynced = updates[g].lastSynced;
+          changed = true;
+        }
+      });
+      if (changed) {
+        await STORE.put("server_groups", JSON.stringify(latest));
+        await STORE.put("data_rev", randomHex(6));
+      }
+    } catch (e) {}
+  }
+
+  return { syncedGroups, totalConfigs, errors };
+}
+
+/* ---------- Save (with conflict detection & cache preservation) ---------- */
 
 async function handleSave(request) {
   const data = await readJson(request);
@@ -347,6 +450,7 @@ async function handleSave(request) {
     const keys = Object.keys(data.groups);
     if (keys.length > MAX_GROUPS) throw new HttpError(400, 'Too many groups (max ' + MAX_GROUPS + ').');
 
+    const existingGroups = await envFetchGroups();
     const normalizedGroups = {};
     const usedNames = {};
     const prepared = keys.map(k => {
@@ -354,13 +458,29 @@ async function handleSave(request) {
       let unique = name, n = 2;
       while (usedNames[unique]) { unique = name + '_' + n; n++; }
       usedNames[unique] = true;
-      return { name: unique, entry: limitEntry(normalizeGroupEntry(data.groups[k])) };
+      const incoming = limitEntry(normalizeGroupEntry(data.groups[k]));
+      const prev = existingGroups[unique] || existingGroups[k];
+      // Preserve newer background cache if the group's URLs did not change
+      if (
+        prev &&
+        incoming.mode === 'sub' &&
+        prev.mode === 'sub' &&
+        JSON.stringify(prev.subUrls) === JSON.stringify(incoming.subUrls) &&
+        (prev.lastSynced || 0) > (incoming.lastSynced || 0)
+      ) {
+        incoming.cachedSubConfigs = limitEntry(prev).cachedSubConfigs;
+        incoming.lastSynced = prev.lastSynced;
+      }
+      return { name: unique, entry: incoming };
     });
 
     await Promise.all(prepared.map(async (p) => {
       if (p.entry.mode === 'sub' && p.entry.subUrls.length > 0) {
         const res = await fetchAndDecodeSubUrls(p.entry.subUrls);
-        if (res.configs.length > 0) p.entry.cachedSubConfigs = res.configs.slice(0, MAX_ENTRIES_PER_GROUP);
+        if (res.configs.length > 0) {
+          p.entry.cachedSubConfigs = res.configs.slice(0, MAX_ENTRIES_PER_GROUP);
+          p.entry.lastSynced = Date.now();
+        }
       }
     }));
     prepared.forEach(p => { normalizedGroups[p.name] = p.entry; });   // keeps the order from the UI
@@ -374,6 +494,10 @@ async function handleSave(request) {
   if (typeof data.subTitle === 'string') {
     const cleanTitle = data.subTitle.trim().slice(0, 100) || DEFAULT_SUB_TITLE;
     await STORE.put("sub_title", cleanTitle);
+  }
+  if (typeof data.autoSync === 'string') {
+    const cleanSync = (data.autoSync === 'daily' || data.autoSync === 'weekly') ? data.autoSync : 'off';
+    await STORE.put("auto_sync_schedule", cleanSync);
   }
 
   const newRev = randomHex(6);
@@ -393,14 +517,16 @@ function limitEntry(entry) {
   const clip = list => list.filter(l => l.length <= MAX_LINE_LENGTH).slice(0, MAX_ENTRIES_PER_GROUP);
   return {
     mode: entry.mode,
+    enabled: entry.enabled !== false,
     configs: clip(entry.configs),
     subUrls: clip(entry.subUrls).slice(0, MAX_SUB_URLS_PER_GROUP),
-    cachedSubConfigs: clip(entry.cachedSubConfigs)
+    cachedSubConfigs: clip(entry.cachedSubConfigs),
+    lastSynced: Number(entry.lastSynced) > 0 ? Number(entry.lastSynced) : 0
   };
 }
 
 /* ------------------------------------------------------------------ */
-/* Subscription output                                                 */
+/* Subscription output (auto-syncs remote sub links on client update)  */
 /* ------------------------------------------------------------------ */
 
 function isSubRequestAuthorized(url, token) {
@@ -428,17 +554,26 @@ async function buildSubscriptionResponse(url) {
   const groupNames = Object.keys(serverGroups);
   const cleaned = {};
   const cacheUpdates = {};
+  const now = Date.now();
 
   await Promise.all(groupNames.map(async (g) => {
     const entry = normalizeGroupEntry(serverGroups[g]);
+    if (entry.enabled === false) {
+      cleaned[g] = [];
+      return;
+    }
     if (entry.mode === 'sub') {
       if (entry.subUrls.length > 0) {
+        // Every time a client app updates the subscription link, sync external subUrls live
         const fetchResult = await fetchAndDecodeSubUrls(entry.subUrls);
         if (fetchResult.configs.length > 0) {
-          cleaned[g] = fetchResult.configs;
-          if (JSON.stringify(entry.cachedSubConfigs) !== JSON.stringify(fetchResult.configs)) {
-            cacheUpdates[g] = { subUrls: entry.subUrls, configs: fetchResult.configs.slice(0, MAX_ENTRIES_PER_GROUP) };
-          }
+          const clipped = fetchResult.configs.slice(0, MAX_ENTRIES_PER_GROUP);
+          cleaned[g] = clipped;
+          cacheUpdates[g] = {
+            subUrls: entry.subUrls,
+            configs: clipped,
+            lastSynced: now
+          };
         } else {
           // Fall back to cached configs if the remote server is temporarily unreachable
           cleaned[g] = entry.cachedSubConfigs.filter(c => typeof c === 'string' && c.trim() !== '');
@@ -462,8 +597,7 @@ async function buildSubscriptionResponse(url) {
     }
   }));
 
-  // Refresh cached configs WITHOUT overwriting edits an admin may have saved in the meantime:
-  // re-read the latest data and only touch groups whose link list is unchanged.
+  // Persist freshly synced configs and timestamp to KV without overwriting concurrent admin edits
   if (Object.keys(cacheUpdates).length > 0) {
     try {
       const latest = await envFetchGroups();
@@ -472,6 +606,7 @@ async function buildSubscriptionResponse(url) {
         const cur = latest[g];
         if (cur && cur.mode === 'sub' && JSON.stringify(cur.subUrls) === JSON.stringify(cacheUpdates[g].subUrls)) {
           cur.cachedSubConfigs = cacheUpdates[g].configs;
+          cur.lastSynced = cacheUpdates[g].lastSynced;
           changed = true;
         }
       });
@@ -670,10 +805,11 @@ function normalizeGroupEntry(rawEntry) {
     const subUrls = cleaned.filter(c => isHttpUrl(c));
     const configs = cleaned.filter(c => !isHttpUrl(c));
     const mode = (subUrls.length > 0 && configs.length === 0) ? 'sub' : 'configs';
-    return { mode, configs, subUrls, cachedSubConfigs: [] };
+    return { mode, enabled: true, configs, subUrls, cachedSubConfigs: [], lastSynced: 0 };
   }
   if (rawEntry && typeof rawEntry === 'object') {
     const mode = rawEntry.mode === 'sub' ? 'sub' : 'configs';
+    const enabled = rawEntry.enabled !== false;
     const configs = Array.isArray(rawEntry.configs)
       ? splitNonEmptyLines(rawEntry.configs.join('\n')).filter(c => !isHttpUrl(c))
       : [];
@@ -683,9 +819,10 @@ function normalizeGroupEntry(rawEntry) {
     const cachedSubConfigs = Array.isArray(rawEntry.cachedSubConfigs)
       ? splitNonEmptyLines(rawEntry.cachedSubConfigs.join('\n')).filter(c => !isHttpUrl(c))
       : [];
-    return { mode, configs, subUrls, cachedSubConfigs };
+    const lastSynced = Number(rawEntry.lastSynced) > 0 ? Number(rawEntry.lastSynced) : 0;
+    return { mode, enabled, configs, subUrls, cachedSubConfigs, lastSynced };
   }
-  return { mode: 'configs', configs: [], subUrls: [], cachedSubConfigs: [] };
+  return { mode: 'configs', enabled: true, configs: [], subUrls: [], cachedSubConfigs: [], lastSynced: 0 };
 }
 
 function normalizeAllGroups(rawGroups) {
@@ -741,6 +878,23 @@ async function envFetchRotationChunk() {
     }
   } catch (e) {}
   return DEFAULT_ROTATION_CHUNK;
+}
+
+async function envFetchAutoSync() {
+  try {
+    const s = await STORE.get("auto_sync_schedule");
+    if (s === 'daily' || s === 'weekly' || s === 'off') return s;
+  } catch (e) {}
+  return DEFAULT_AUTO_SYNC;
+}
+
+async function envFetchLastAutoSync() {
+  try {
+    const n = parseInt(await STORE.get("last_auto_sync"), 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch (e) {
+    return 0;
+  }
 }
 
 async function envFetchRev() {
@@ -942,7 +1096,7 @@ const THEME_CSS = `
   :root:not([data-theme="light"]) {${DARK_VARS}}
 }
 :root[data-theme="dark"] {${DARK_VARS}}
-* { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: border-box; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
@@ -1098,14 +1252,16 @@ input:focus { outline: none; border-color: var(--accent); }
 /* MAIN DASHBOARD                                                      */
 /* ------------------------------------------------------------------ */
 
-function getAdminPanelHTML(nonce, baseUrl, serverGroups, rotationChunk, subToken, subTitle, rev) {
+function getAdminPanelHTML(nonce, baseUrl, serverGroups, rotationChunk, subToken, subTitle, rev, autoSync, lastAutoSync) {
   const boot = {
     origin: String(baseUrl),
     groups: normalizeAllGroups(serverGroups),
     chunk: Number(rotationChunk) >= 1 ? Number(rotationChunk) : DEFAULT_ROTATION_CHUNK,
     token: String(subToken || ''),
     title: String(subTitle || DEFAULT_SUB_TITLE),
-    rev: String(rev || '0')
+    rev: String(rev || '0'),
+    autoSync: String(autoSync || DEFAULT_AUTO_SYNC),
+    lastAutoSync: Number(lastAutoSync) || 0
   };
   const bootJson = JSON.stringify(boot).replace(/</g, '\\u003c');
 
@@ -1145,7 +1301,7 @@ h1 { margin: 0; font-size: 18px; color: var(--strong); letter-spacing: -0.01em; 
 .main { min-width: 0; }
 
 /* Buttons */
-.btn { background: var(--accent); color: var(--accent-ink); border: 1px solid transparent; padding: 0 15px; min-height: 38px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13.5px; font-family: inherit; transition: background .15s, transform .1s; white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+.btn { background: var(--accent); color: var(--accent-ink); border: 1px solid transparent; padding: 0 15px; min-height: 38px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13.5px; font-family: inherit; transition: background .15s, transform .1s; white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; gap: 7px; text-decoration: none; }
 .btn:hover { background: var(--accent-hover); }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
@@ -1176,7 +1332,8 @@ h1 { margin: 0; font-size: 18px; color: var(--strong); letter-spacing: -0.01em; 
 /* Subscription link */
 .link-row { margin-top: 12px; display: flex; align-items: center; gap: 8px; background: var(--field); border: 1px solid var(--line); border-radius: 8px; padding: 6px 6px 6px 12px; }
 .link-row code { color: var(--code); font-family: var(--mono); font-size: 12.5px; word-break: break-all; flex: 1; min-width: 0; }
-.link-actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 10px; }
+.link-actions { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; margin-top: 10px; }
+.link-subactions { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 .banner { margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; background: var(--amber-soft); color: var(--amber-text); border-radius: 8px; padding: 10px 12px; font-size: 12.5px; line-height: 1.5; }
 
 /* Form bits */
@@ -1198,11 +1355,12 @@ h1 { margin: 0; font-size: 18px; color: var(--strong); letter-spacing: -0.01em; 
 .color-field input[type="color"] { width: 100%; height: 38px; padding: 2px; background: var(--field); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
 .color-actions { margin-top: 12px; display: flex; justify-content: flex-end; }
 
-/* Rotation */
-.segmented { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
-.preset { background: transparent; border: 1px solid var(--line); color: var(--text); min-width: 38px; min-height: 34px; padding: 0 11px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; transition: all .15s; font-family: inherit; }
-.preset:hover { background: var(--surface-2); }
-.preset.active { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+/* Rotation & Segmented buttons */
+.segmented { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.preset, .sync-opt { background: transparent; border: 1px solid var(--line); color: var(--text); min-width: 38px; min-height: 34px; padding: 0 11px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; transition: all .15s; font-family: inherit; }
+.preset:hover, .sync-opt:hover { background: var(--surface-2); }
+.preset.active, .sync-opt.active { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.sync-opt { flex: 1; font-weight: 600; }
 .custom-wrap { display: flex; align-items: center; gap: 6px; background: var(--field); border: 1px solid var(--line); border-radius: 8px; padding: 0 10px; min-height: 34px; }
 .custom-wrap label { font-size: 12px; color: var(--muted); }
 .custom-wrap input { width: 48px; background: transparent; border: none; color: var(--strong); font-size: 13.5px; font-weight: 700; text-align: center; font-family: inherit; }
@@ -1211,6 +1369,7 @@ h1 { margin: 0; font-size: 18px; color: var(--strong); letter-spacing: -0.01em; 
 .rotation-example { margin-top: 10px; font-size: 12.5px; color: var(--muted); line-height: 1.55; }
 .rotation-example b { color: var(--text); }
 .disclosure { margin-top: 12px; width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 10px; background: transparent; border: none; border-top: 1px dashed var(--line); padding: 12px 0 0; cursor: pointer; color: var(--text); font-family: inherit; font-size: 13px; font-weight: 600; text-align: left; }
+.disclosure.no-border { margin-top: 0; border-top: none; padding-top: 0; }
 .disclosure .left { display: inline-flex; align-items: center; gap: 8px; }
 .disclosure .chev { transition: transform .18s; color: var(--muted); }
 .disclosure[aria-expanded="true"] .chev { transform: rotate(90deg); }
@@ -1224,18 +1383,26 @@ h1 { margin: 0; font-size: 18px; color: var(--strong); letter-spacing: -0.01em; 
 .batch-sep { color: var(--muted-2); font-size: 11px; align-self: center; }
 .batch-more { font-size: 12px; color: var(--muted); align-self: center; }
 
-/* Groups toolbar */
+/* Groups toolbar & search */
 .groups-toolbar { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin: 0 2px 12px; }
 .groups-toolbar h2 { margin: 0; font-size: 20px; color: var(--strong); letter-spacing: -0.02em; }
 .groups-toolbar p { margin: 3px 0 0; font-size: 13px; color: var(--muted); }
-.toolbar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.toolbar-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.filter-bar { display: flex; align-items: center; gap: 8px; margin: 0 2px 14px; flex-wrap: wrap; }
+.search-wrap { position: relative; flex: 1; min-width: 200px; }
+.search-input { width: 100%; background: var(--surface); border: 1px solid var(--line); color: var(--strong); border-radius: 8px; padding: 8px 32px 8px 12px; font-size: 13px; font-family: inherit; }
+.search-input:focus { outline: none; border-color: var(--accent); }
+.search-clear { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 4px 6px; border-radius: 6px; }
+.search-clear:hover { color: var(--strong); background: var(--surface-2); }
 
 /* Group cards: use the "groups" colour */
-.server-group { background: var(--group); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px 14px; transition: border-color .15s; }
+.server-group { background: var(--group); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px 14px; transition: border-color .15s, opacity .15s; }
 .server-group:hover { border-color: var(--muted-2); }
 .server-group.dragging { opacity: .35; }
 .server-group.collapsed .group-body { display: none; }
 .server-group.collapsed .group-header { margin-bottom: 0; }
+.server-group.is-disabled { opacity: .62; border-style: dashed; }
+.server-group.is-disabled .avatar { background: var(--surface-3); color: var(--muted); }
 .drop-zone { position: relative; height: 14px; border-radius: 8px; border: 2px dashed transparent; display: flex; align-items: center; justify-content: center; transition: background-color .1s, border-color .1s; }
 body.is-dragging .drop-zone { border-color: var(--line); }
 body.is-dragging .drop-zone.hover { border-color: var(--accent); border-style: solid; background: var(--accent-soft); }
@@ -1265,6 +1432,13 @@ body.is-dragging .insert-btn { display: none; }
 .badge { background: var(--surface-2); color: var(--muted); font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; white-space: nowrap; }
 .badge.empty { background: var(--red-soft); color: var(--red-text); }
 .badge.sub-mode { background: var(--green-soft); color: var(--green-text); }
+.badge.paused { background: var(--amber-soft); color: var(--amber-text); }
+
+.enable-btn { background: var(--surface-2); border: 1px solid var(--line); color: var(--text); font-size: 12px; font-weight: 700; min-height: 32px; padding: 0 10px; border-radius: 8px; cursor: pointer; font-family: inherit; display: inline-flex; align-items: center; gap: 6px; }
+.enable-btn:hover { background: var(--surface-3); }
+.enable-btn .state-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+.enable-btn.off .state-dot { background: var(--muted-2); }
+.enable-btn.off { color: var(--muted); }
 
 .chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 10px; }
 .chips:empty { display: none; }
@@ -1309,12 +1483,14 @@ kbd { font-family: var(--mono); font-size: 10.5px; background: rgba(127,127,127,
 .toast.out { opacity: 0; transform: translateX(14px); transition: all .22s; }
 @keyframes toastIn { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
 
-/* Dialog */
+/* Dialog & QR modal */
 dialog.dlg { border: 1px solid var(--line); background: var(--surface); color: var(--text); border-radius: 14px; padding: 24px; max-width: 440px; width: calc(100vw - 32px); box-shadow: var(--shadow); }
 dialog.dlg::backdrop { background: rgba(0,0,0,.5); }
 dialog.dlg h3 { margin: 0 0 8px; font-size: 17px; color: var(--strong); }
 dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(--muted); }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.qr-box { display: grid; place-items: center; background: #ffffff; border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin: 12px 0 18px; }
+.qr-box svg { width: 220px; height: 220px; display: block; }
 
 @media (max-width: 940px) {
   .layout { grid-template-columns: 1fr; }
@@ -1364,7 +1540,7 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
 
       <section class="card" aria-labelledby="linkTitle">
         <h2 class="card-title" id="linkTitle">Your subscription link</h2>
-        <div class="card-desc">Paste this into your app. Anyone with the link can use your configs, so keep it private.</div>
+        <div class="card-desc">Paste this into your app. External subscription links inside your groups sync automatically every time your app updates this link.</div>
         <div class="link-row">
           <code id="subUrl"></code>
           <button class="btn btn-ghost btn-sm" id="toggleLinkBtn" type="button" aria-pressed="false">Show</button>
@@ -1375,7 +1551,11 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
         </div>
         <div class="link-actions">
           <button class="btn" id="copySubBtn" type="button">Copy link</button>
+          <button class="btn btn-ghost" id="qrSubBtn" type="button" title="Show QR code for mobile apps">QR code</button>
           <button class="btn btn-ghost" id="regenTokenBtn" type="button">New link</button>
+        </div>
+        <div class="link-subactions">
+          <a class="btn btn-ghost btn-sm" id="openPlainBtn" href="#" target="_blank" rel="noopener">Preview plain output ↗</a>
         </div>
       </section>
 
@@ -1386,6 +1566,17 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
           <label class="field-label first" for="subTitleInput">Subscription name</label>
           <input class="text-input" type="text" id="subTitleInput" maxlength="100" placeholder="Subscription name" autocomplete="off">
           <div class="card-desc">Apps show this as the name of your subscription. They pick up changes on their next refresh.</div>
+        </div>
+
+        <div class="card-section">
+          <h3 class="card-title sm" id="autoSyncTitle">Scheduled background sync</h3>
+          <div class="card-desc">External links always sync live when your client app updates. You can also turn on a background schedule:</div>
+          <div class="segmented" role="group" aria-labelledby="autoSyncTitle">
+            <button type="button" class="sync-opt" data-sync="off">Off</button>
+            <button type="button" class="sync-opt" data-sync="daily">Daily</button>
+            <button type="button" class="sync-opt" data-sync="weekly">Weekly</button>
+          </div>
+          <div class="card-desc" id="autoSyncHint" style="margin-top:8px;"></div>
         </div>
 
         <div class="card-section">
@@ -1414,15 +1605,20 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
         </div>
 
         <div class="card-section">
-          <h3 class="card-title sm" id="colorsTitle">Colors</h3>
-          <div class="card-desc">Pick a preset or choose your own. Saved in this browser only.</div>
-          <div class="palette-row" id="palettes" role="group" aria-labelledby="colorsTitle"></div>
-          <div class="color-grid">
-            <label class="color-field"><span>Background</span><input type="color" id="colorBg"></label>
-            <label class="color-field"><span>Groups</span><input type="color" id="colorGroup"></label>
-            <label class="color-field"><span>Buttons</span><input type="color" id="colorButton"></label>
+          <button class="disclosure no-border" id="colorsToggle" type="button" aria-expanded="false" aria-controls="colorsBody">
+            <span class="left"><span class="ico chev" id="colorsChev"></span><span>Appearance &amp; colors</span></span>
+            <span class="meta" id="colorsMeta">System / custom</span>
+          </button>
+          <div id="colorsBody" hidden style="margin-top:10px;">
+            <div class="card-desc">Pick a preset or choose your own. Saved in this browser only.</div>
+            <div class="palette-row" id="palettes" role="group" aria-label="Color presets"></div>
+            <div class="color-grid">
+              <label class="color-field"><span>Background</span><input type="color" id="colorBg"></label>
+              <label class="color-field"><span>Groups</span><input type="color" id="colorGroup"></label>
+              <label class="color-field"><span>Buttons</span><input type="color" id="colorButton"></label>
+            </div>
+            <div class="color-actions"><button class="btn btn-ghost btn-sm" id="resetColorsBtn" type="button">Reset to default</button></div>
           </div>
-          <div class="color-actions"><button class="btn btn-ghost btn-sm" id="resetColorsBtn" type="button">Reset to default</button></div>
         </div>
       </section>
     </aside>
@@ -1431,12 +1627,19 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       <div class="groups-toolbar">
         <div>
           <h2>Server groups</h2>
-          <p>Paste direct configs or a subscription link into each group. Reorder with the arrows or drag the handle.</p>
+          <p>Paste direct configs or a subscription link into each group. Pause, reorder or sync anytime.</p>
         </div>
         <div class="toolbar-actions">
+          <button class="btn btn-ghost btn-sm" id="syncAllBtn" type="button">Sync all links</button>
           <button class="btn btn-ghost btn-sm" id="collapseAllBtn" type="button">Collapse all</button>
           <button class="btn btn-ghost btn-sm" id="expandAllBtn" type="button">Expand all</button>
           <button class="btn btn-sm" id="addGroupList" type="button">+ Add group</button>
+        </div>
+      </div>
+      <div class="filter-bar">
+        <div class="search-wrap">
+          <input type="search" class="search-input" id="groupFilterInput" placeholder="Filter groups by name or protocol (e.g. Germany, vless, ipv6)…" autocomplete="off">
+          <button type="button" class="search-clear" id="clearFilterBtn" hidden title="Clear filter">✕</button>
         </div>
       </div>
       <div id="groupsContainer"></div>
@@ -1468,10 +1671,14 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
   var currentSubToken = boot.token;
   var currentSubTitle = boot.title;
   var currentRev = boot.rev;
+  var currentAutoSync = boot.autoSync || 'off';
+  var lastAutoSyncTime = boot.lastAutoSync || 0;
+
   var collapsed = new Set();
   var linkVisible = false;
   var hasUnsavedChanges = false;
   var saving = false;
+  var currentFilter = '';
 
   var dragFromIndex = null;
   var dropPosition = null;
@@ -1515,6 +1722,162 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
   function display(name) { return String(name).replace(/_/g, ' '); }
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : (many || one + 's')); }
 
+  function formatAgo(ts) {
+    var n = Number(ts) || 0;
+    if (n <= 0) return '';
+    var diffSec = Math.max(0, Math.floor((Date.now() - n) / 1000));
+    if (diffSec < 45) return 'just now';
+    var mins = Math.floor(diffSec / 60);
+    if (mins < 60) return mins + 'm ago';
+    var hrs = Math.floor(mins / 60);
+    if (hrs < 24) return hrs + 'h ago';
+    var days = Math.floor(hrs / 24);
+    return days + 'd ago';
+  }
+
+  /* ---------- Zero-dependency QR Code SVG generator (Byte mode, ECC-L, V1-V8) ---------- */
+  function buildQrSvg(text) {
+    var data = Array.from(new TextEncoder().encode(String(text || '')));
+    // [totalCodewords, dataCodewords, numBlocks] for Versions 1..8 at ECC Level L
+    var VERSIONS = [
+      null,
+      [26, 19, 1], [44, 34, 1], [70, 55, 1], [100, 80, 1],
+      [134, 108, 1], [172, 136, 2], [196, 156, 2], [242, 194, 2]
+    ];
+    var ver = 1;
+    while (ver <= 8 && data.length + 2 > VERSIONS[ver][1]) ver++;
+    if (ver > 8) return null;
+
+    var vInfo = VERSIONS[ver];
+    var totalCw = vInfo[0], dataCw = vInfo[1], blocks = vInfo[2];
+    var eccCwPerBlock = (totalCw - dataCw) / blocks;
+    var dataCwPerBlock = dataCw / blocks;
+
+    var bits = [];
+    function pushBits(val, len) {
+      for (var i = len - 1; i >= 0; i--) bits.push((val >>> i) & 1);
+    }
+    pushBits(4, 4); // Byte mode
+    pushBits(data.length, 8);
+    data.forEach(function (b) { pushBits(b, 8); });
+    var maxBits = dataCw * 8;
+    pushBits(0, Math.min(4, maxBits - bits.length));
+    while (bits.length % 8 !== 0) bits.push(0);
+    var cw = [];
+    for (var i = 0; i < bits.length; i += 8) {
+      var byte = 0;
+      for (var j = 0; j < 8; j++) byte = (byte << 1) | bits[i + j];
+      cw.push(byte);
+    }
+    var padIdx = 0;
+    while (cw.length < dataCw) { cw.push(padIdx % 2 === 0 ? 0xEC : 0x11); padIdx++; }
+
+    // GF(256) math for Reed-Solomon
+    var exp = new Uint8Array(512), log = new Uint8Array(256);
+    var x = 1;
+    for (var i = 0; i < 255; i++) {
+      exp[i] = x; log[x] = i;
+      x = (x << 1) ^ ((x & 0x80) ? 0x11D : 0);
+    }
+    for (var i = 255; i < 512; i++) exp[i] = exp[i - 255];
+    function gfMul(a, b) { return (a === 0 || b === 0) ? 0 : exp[log[a] + log[b]]; }
+
+    var gen = [1];
+    for (var i = 0; i < eccCwPerBlock; i++) {
+      var next = new Array(gen.length + 1).fill(0);
+      for (var j = 0; j < gen.length; j++) {
+        next[j] ^= gen[j];
+        next[j + 1] ^= gfMul(gen[j], exp[i]);
+      }
+      gen = next;
+    }
+
+    var dataBlocks = [], eccBlocks = [];
+    for (var b = 0; b < blocks; b++) {
+      var slice = cw.slice(b * dataCwPerBlock, (b + 1) * dataCwPerBlock);
+      dataBlocks.push(slice);
+      var rem = new Array(eccCwPerBlock).fill(0);
+      slice.forEach(function (byte) {
+        var factor = byte ^ rem.shift();
+        rem.push(0);
+        for (var j = 0; j < eccCwPerBlock; j++) rem[j] ^= gfMul(gen[j + 1], factor);
+      });
+      eccBlocks.push(rem);
+    }
+
+    var finalCw = [];
+    for (var i = 0; i < dataCwPerBlock; i++) for (var b = 0; b < blocks; b++) finalCw.push(dataBlocks[b][i]);
+    for (var i = 0; i < eccCwPerBlock; i++) for (var b = 0; b < blocks; b++) finalCw.push(eccBlocks[b][i]);
+
+    var size = ver * 4 + 17;
+    var mat = Array.from({ length: size }, function () { return new Array(size).fill(null); });
+    var isFunc = Array.from({ length: size }, function () { return new Array(size).fill(false); });
+
+    function setMod(r, c, val) {
+      if (r >= 0 && r < size && c >= 0 && c < size) { mat[r][c] = !!val; isFunc[r][c] = true; }
+    }
+    function finder(r, c) {
+      for (var dy = -1; dy <= 7; dy++) for (var dx = -1; dx <= 7; dx++) {
+        var inOuter = (dy >= 0 && dy <= 6 && dx >= 0 && dx <= 6);
+        var onRing = (dy === 0 || dy === 6 || dx === 0 || dx === 6);
+        var inCore = (dy >= 2 && dy <= 4 && dx >= 2 && dx <= 4);
+        setMod(r + dy, c + dx, inOuter && (onRing || inCore));
+      }
+    }
+    finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
+    for (var i = 8; i < size - 8; i++) { setMod(6, i, i % 2 === 0); setMod(i, 6, i % 2 === 0); }
+
+    var ALIGN = [[], [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42]][ver];
+    for (var i = 0; i < ALIGN.length; i++) for (var j = 0; j < ALIGN.length; j++) {
+      var ar = ALIGN[i], ac = ALIGN[j];
+      if (isFunc[ar][ac]) continue;
+      for (var dy = -2; dy <= 2; dy++) for (var dx = -2; dx <= 2; dx++) {
+        setMod(ar + dy, ac + dx, Math.max(Math.abs(dy), Math.abs(dx)) !== 1);
+      }
+    }
+    for (var i = 0; i < 9; i++) {
+      if (i !== 6) { setMod(8, i, false); setMod(i, 8, false); }
+      if (i < 8) { setMod(8, size - 1 - i, false); setMod(size - 1 - i, 8, false); }
+    }
+    setMod(size - 8, 8, true);
+
+    var allBits = [];
+    finalCw.forEach(function (byte) { for (var i = 7; i >= 0; i--) allBits.push((byte >>> i) & 1); });
+    var bitIdx = 0, up = true;
+    for (var right = size - 1; right >= 1; right -= 2) {
+      if (right === 6) right = 5;
+      for (var vert = 0; vert < size; vert++) {
+        var r = up ? (size - 1 - vert) : vert;
+        for (var j = 0; j < 2; j++) {
+          var c = right - j;
+          if (!isFunc[r][c]) {
+            var dark = bitIdx < allBits.length ? (allBits[bitIdx++] === 1) : false;
+            if ((r + c) % 2 === 0) dark = !dark; // mask 0
+            mat[r][c] = dark;
+          }
+        }
+      }
+      up = !up;
+    }
+
+    // Format bits for ECC Level L (01) + Mask 0 (000) -> 0x77c4
+    var fmt = 0x77c4;
+    for (var i = 0; i <= 5; i++) setMod(8, i, ((fmt >>> i) & 1) === 1);
+    setMod(8, 7, ((fmt >>> 6) & 1) === 1);
+    setMod(8, 8, ((fmt >>> 7) & 1) === 1);
+    setMod(7, 8, ((fmt >>> 8) & 1) === 1);
+    for (var i = 9; i < 15; i++) setMod(14 - i, 8, ((fmt >>> i) & 1) === 1);
+    for (var i = 0; i < 8; i++) setMod(8, size - 1 - i, ((fmt >>> i) & 1) === 1);
+    for (var i = 8; i < 15; i++) setMod(size - 15 + i, 8, ((fmt >>> i) & 1) === 1);
+
+    var path = '';
+    for (var r = 0; r < size; r++) for (var c = 0; c < size; c++) {
+      if (mat[r][c]) path += 'M' + (c + 2) + ',' + (r + 2) + 'h1v1h-1z';
+    }
+    var view = size + 4;
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + view + ' ' + view + '" shape-rendering="crispEdges"><rect width="' + view + '" height="' + view + '" fill="#fff"/><path d="' + path + '" fill="#000"/></svg>';
+  }
+
   /* ---------- colour settings (saved in this browser) ---------- */
   var COLOR_PRESETS = [
     { name: 'Light', bg: '#f4f5f7', group: '#ffffff', button: '#2563eb' },
@@ -1522,7 +1885,7 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     { name: 'Sand',  bg: '#f6f3ec', group: '#fffdf8', button: '#0f766e' },
     { name: 'Mint',  bg: '#edf5f0', group: '#ffffff', button: '#15803d' }
   ];
-  var colors = null;   // null = default (follows the system light/dark setting)
+  var colors = null;
 
   function currentTheme() {
     var t = document.documentElement.getAttribute('data-theme');
@@ -1555,12 +1918,15 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     $('colorBg').value = c.bg;
     $('colorGroup').value = c.group;
     $('colorButton').value = c.button;
+    var activePresetName = colors ? 'Custom' : 'System default';
     document.querySelectorAll('.palette-btn').forEach(function (b) {
       var p = COLOR_PRESETS[parseInt(b.getAttribute('data-i'), 10)];
       var on = !!colors && p.bg === c.bg && p.group === c.group && p.button === c.button;
+      if (on) activePresetName = p.name;
       b.classList.toggle('active', on);
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
+    $('colorsMeta').textContent = activePresetName;
   }
   function setColors(next) {
     colors = next;
@@ -1617,13 +1983,13 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     timer = setTimeout(dismiss, opts.duration || 3200);
   }
 
-  // choices: [{label, value, kind:'primary'|'ghost'|'danger'}]; resolves to the chosen value
   function choose(opts) {
     return new Promise(function (resolve) {
       var result = opts.dismissValue;
       var dlg = h('dialog', { 'class': 'dlg', 'aria-labelledby': 'dlgTitle' });
       dlg.appendChild(h('h3', { id: 'dlgTitle', text: opts.title }));
       dlg.appendChild(h('p', { text: opts.body }));
+      if (opts.customNode) dlg.appendChild(opts.customNode);
       var actions = h('div', { 'class': 'dlg-actions' });
       opts.choices.forEach(function (c, i) {
         var cls = 'btn' + (c.kind === 'ghost' ? ' btn-ghost' : (c.kind === 'danger' ? ' btn-danger' : ''));
@@ -1649,7 +2015,31 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     });
   }
 
-  /* ---------- parsing (mirrors the server) ---------- */
+  function showQrModal() {
+    var fullLink = BASE_ORIGIN + '/sub/' + currentSubToken;
+    var svgMarkup = buildQrSvg(fullLink);
+    var box = h('div', { 'class': 'qr-box' });
+    if (svgMarkup) {
+      box.innerHTML = svgMarkup;
+    } else {
+      box.textContent = 'Link is too long for inline QR.';
+    }
+    choose({
+      title: 'Scan subscription link',
+      body: 'Scan this QR code with your V2Ray / proxy client app to import your subscription immediately.',
+      customNode: box,
+      dismissValue: true,
+      focus: 0,
+      choices: [
+        { label: 'Copy link', value: 'copy', kind: 'ghost' },
+        { label: 'Done', value: 'done', kind: 'primary' }
+      ]
+    }).then(function (val) {
+      if (val === 'copy') copySubLink();
+    });
+  }
+
+  /* ---------- parsing (mirrors the server + smart Base64 decode) ---------- */
   function getScheme(line) {
     var m = String(line || '').trim().match(new RegExp('^([a-z][a-z0-9+.-]*)://', 'i'));
     return m ? m[1].toLowerCase() : '';
@@ -1663,6 +2053,22 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     return false;
   }
   function isComment(l) { return l.indexOf('//') === 0 || l.indexOf(';') === 0 || l.indexOf('#') === 0; }
+
+  function tryDecodeBase64Block(rawStr) {
+    var s = String(rawStr || '').trim().replace(/\s+/g, '');
+    if (s.length < 16 || SCHEME_RE.test(s) || !/^[A-Za-z0-9+/_=-]+$/.test(s)) return null;
+    var norm = s.replace(/-/g, '+').replace(/_/g, '/');
+    var pad = (4 - (norm.length % 4)) % 4;
+    norm += '='.repeat(pad);
+    try {
+      var decoded = '';
+      try { decoded = decodeURIComponent(escape(atob(norm))); } catch (e) { decoded = atob(norm); }
+      var lines = decoded.split(NEWLINE).map(function (l) { return l.trim(); }).filter(function (l) { return SCHEME_RE.test(l) && !isHttpLine(l); });
+      return lines.length > 0 ? lines : null;
+    } catch (e) {
+      return null;
+    }
+  }
 
   // Any "scheme://" starts a NEW entry. Returns entries plus how many lines were ignored.
   function analyze(text) {
@@ -1698,23 +2104,26 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       var lines = entry.map(function (c) { return String(c || '').trim(); }).filter(Boolean);
       var subUrls = lines.filter(isHttpLine);
       var configs = lines.filter(function (l) { return !isHttpLine(l); });
-      return { mode: (subUrls.length > 0 && configs.length === 0) ? 'sub' : 'configs', configs: configs, subUrls: subUrls, cachedSubConfigs: [] };
+      return { mode: (subUrls.length > 0 && configs.length === 0) ? 'sub' : 'configs', enabled: true, configs: configs, subUrls: subUrls, cachedSubConfigs: [], lastSynced: 0 };
     }
     if (entry && typeof entry === 'object') {
       return {
         mode: entry.mode === 'sub' ? 'sub' : 'configs',
+        enabled: entry.enabled !== false,
         configs: Array.isArray(entry.configs) ? entry.configs : [],
         subUrls: Array.isArray(entry.subUrls) ? entry.subUrls : [],
-        cachedSubConfigs: Array.isArray(entry.cachedSubConfigs) ? entry.cachedSubConfigs : []
+        cachedSubConfigs: Array.isArray(entry.cachedSubConfigs) ? entry.cachedSubConfigs : [],
+        lastSynced: Number(entry.lastSynced) > 0 ? Number(entry.lastSynced) : 0
       };
     }
-    return { mode: 'configs', configs: [], subUrls: [], cachedSubConfigs: [] };
+    return { mode: 'configs', enabled: true, configs: [], subUrls: [], cachedSubConfigs: [], lastSynced: 0 };
   }
 
   /* ---------- subscription link card ---------- */
   function renderLink() {
     var shown = linkVisible ? currentSubToken : '\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022\\u2022';
     $('subUrl').textContent = BASE_ORIGIN + '/sub/' + shown;
+    $('openPlainBtn').href = BASE_ORIGIN + '/sub/' + currentSubToken + '?format=plain';
     $('toggleLinkBtn').textContent = linkVisible ? 'Hide' : 'Show';
     $('toggleLinkBtn').setAttribute('aria-pressed', linkVisible ? 'true' : 'false');
     $('legacyBanner').hidden = currentSubToken.length >= 16;
@@ -1724,7 +2133,6 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     var text = BASE_ORIGIN + '/sub/' + currentSubToken;
     var btn = $('copySubBtn');
     function done() {
-      var orig = btn.textContent;
       btn.textContent = 'Copied!';
       showToast('Subscription link copied', 'ok');
       setTimeout(function () { btn.textContent = 'Copy link'; }, 1600);
@@ -1775,6 +2183,27 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
   }
 
   /* ---------- settings ---------- */
+  function setAutoSync(mode) {
+    var clean = (mode === 'daily' || mode === 'weekly') ? mode : 'off';
+    currentAutoSync = clean;
+    updateAutoSyncUI();
+    markDirty(true);
+  }
+  function updateAutoSyncUI() {
+    document.querySelectorAll('.sync-opt').forEach(function (btn) {
+      var active = btn.getAttribute('data-sync') === currentAutoSync;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+    var hint = $('autoSyncHint');
+    if (currentAutoSync === 'off') {
+      hint.textContent = 'Scheduled sync is off. External links still sync automatically whenever your client app updates.';
+    } else {
+      var ago = formatAgo(lastAutoSyncTime);
+      hint.textContent = 'Runs ' + currentAutoSync + ' in the background (add a Cron Trigger in Cloudflare Worker settings).' + (ago ? ' Last background run: ' + ago + '.' : '');
+    }
+  }
+
   function setRotationChunk(val) {
     var parsed = Math.max(1, Math.min(500, parseInt(val, 10) || 1));
     currentRotationChunk = parsed;
@@ -1796,7 +2225,7 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       btn.classList.toggle('active', active);
       btn.setAttribute('aria-pressed', active ? 'true' : 'false');
     });
-    $('divideHintText').textContent = 'Apps get ' + plural(currentRotationChunk, 'config') + ' from each group in turn, then loop back until everything is listed.';
+    $('divideHintText').textContent = 'Apps get ' + plural(currentRotationChunk, 'config') + ' from each active group in turn, then loop back until everything is listed.';
   }
 
   function togglePreview() {
@@ -1804,6 +2233,13 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     var open = btn.getAttribute('aria-expanded') !== 'true';
     btn.setAttribute('aria-expanded', open ? 'true' : 'false');
     $('previewBody').hidden = !open;
+  }
+
+  function toggleColorsDrawer() {
+    var btn = $('colorsToggle');
+    var open = btn.getAttribute('aria-expanded') !== 'true';
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    $('colorsBody').hidden = !open;
   }
 
   /* ---------- dirty state ---------- */
@@ -1817,25 +2253,27 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     $('saveBar').classList.toggle('show', isDirty);
   }
 
-  /* ---------- counts, chips, preview ---------- */
+  /* ---------- counts, chips, preview & search filter ---------- */
   function getGroupInfo(groupEl) {
     var mode = groupEl.dataset.mode === 'sub' ? 'sub' : 'configs';
+    var enabled = groupEl.dataset.enabled !== 'false';
+    var lastSynced = Number(groupEl._lastSynced) || 0;
     if (mode === 'sub') {
       var a = analyze(groupEl.querySelector('.sub-textarea').value);
       var urls = a.entries.filter(isHttpLine);
       var cached = Array.isArray(groupEl._cachedSubConfigs) ? groupEl._cachedSubConfigs : [];
       return {
-        mode: 'sub', count: cached.length, subUrlCount: urls.length, lines: cached,
-        ignored: (a.entries.length - urls.length) + a.ignored, dupes: countDupes(urls)
+        mode: 'sub', enabled: enabled, count: cached.length, subUrlCount: urls.length, lines: cached,
+        ignored: (a.entries.length - urls.length) + a.ignored, dupes: countDupes(urls), lastSynced: lastSynced
       };
     }
     var b = analyze(groupEl.querySelector('.configs-textarea').value);
-    return { mode: 'configs', count: b.entries.length, subUrlCount: 0, lines: b.entries, ignored: b.ignored, dupes: countDupes(b.entries) };
+    return { mode: 'configs', enabled: enabled, count: b.entries.length, subUrlCount: 0, lines: b.entries, ignored: b.ignored, dupes: countDupes(b.entries), lastSynced: 0 };
   }
 
   function renderChips(container, lines) {
     container.innerHTML = '';
-    if (!lines || lines.length === 0) return;
+    if (!lines || lines.length === 0) return [];
     var counts = {};
     var v6 = 0;
     lines.forEach(function (l) {
@@ -1843,10 +2281,15 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       counts[s] = (counts[s] || 0) + 1;
       if (isIPv6Config(l)) v6++;
     });
-    Object.keys(counts).forEach(function (s) {
+    var tags = Object.keys(counts);
+    tags.forEach(function (s) {
       container.appendChild(h('span', { 'class': 'chip', text: s + ' ' + counts[s] }));
     });
-    if (v6 > 0) container.appendChild(h('span', { 'class': 'chip v6', text: 'ipv6 ' + v6 }));
+    if (v6 > 0) {
+      container.appendChild(h('span', { 'class': 'chip v6', text: 'ipv6 ' + v6 }));
+      tags.push('ipv6');
+    }
+    return tags;
   }
 
   function renderPreview(groupInfos) {
@@ -1860,6 +2303,7 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       var added = false;
       for (var i = 0; i < groupInfos.length; i++) {
         var g = groupInfos[i];
+        if (!g.enabled) continue;
         var n = Math.min(chunk, g.count - offset);
         if (n <= 0) continue;
         added = true;
@@ -1878,30 +2322,51 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       box.appendChild(pill);
     });
     if (batches.length > MAX) box.appendChild(h('span', { 'class': 'batch-more', text: '\\u2026 +' + (batches.length - MAX) + ' more' }));
-    if (batches.length === 0) box.appendChild(h('span', { 'class': 'batch-more', text: 'Nothing to preview yet.' }));
+    if (batches.length === 0) box.appendChild(h('span', { 'class': 'batch-more', text: 'Nothing active to preview yet.' }));
     var partials = batches.filter(function (b) { return b.partial; }).length;
     $('previewSummary').textContent = plural(batches.length, 'batch', 'batches') + (partials ? ' \\u2022 ' + partials + ' partial' : '');
     return batches.length;
   }
 
+  function applyGroupFilter() {
+    var q = currentFilter.trim().toLowerCase();
+    $('clearFilterBtn').hidden = !q;
+    var groupEls = document.querySelectorAll('.server-group');
+    var zones = document.querySelectorAll('.drop-zone');
+    zones.forEach(function (z) { z.hidden = !!q; });
+    groupEls.forEach(function (el) {
+      if (!q) { el.hidden = false; return; }
+      var hay = (el.dataset.searchHaystack || '').toLowerCase();
+      el.hidden = hay.indexOf(q) === -1;
+    });
+  }
+
   function updateAllCounts() {
+    updateChunkUI();
     var totalConfigs = 0;
+    var activeGroupCount = 0;
     var groupEls = document.querySelectorAll('.server-group');
     var infos = [];
 
     groupEls.forEach(function (el) {
       var info = getGroupInfo(el);
-      totalConfigs += info.count;
+      if (info.enabled) {
+        totalConfigs += info.count;
+        activeGroupCount += 1;
+      }
 
       var titleInput = el.querySelector('.group-title');
       var cleanTitle = (titleInput && titleInput.value.trim()) ? titleInput.value.trim() : 'Group';
       var keyName = normalizeGroupKey(cleanTitle) || 'Group';
-      infos.push({ name: keyName, count: info.count });
+      infos.push({ name: keyName, count: info.count, enabled: info.enabled });
       var av = el.querySelector('.avatar');
       if (av) av.textContent = cleanTitle.charAt(0);
 
       var badge = el.querySelector('.badge');
-      if (info.mode === 'sub') {
+      if (!info.enabled) {
+        badge.textContent = 'Paused (' + plural(info.count, 'config') + ')';
+        badge.className = 'badge paused';
+      } else if (info.mode === 'sub') {
         if (info.subUrlCount === 0) { badge.textContent = 'No links yet'; badge.className = 'badge empty'; }
         else if (info.count > 0) { badge.textContent = plural(info.subUrlCount, 'link') + ' \\u2022 ' + plural(info.count, 'config'); badge.className = 'badge sub-mode'; }
         else { badge.textContent = plural(info.subUrlCount, 'link') + ' (not synced)'; badge.className = 'badge sub-mode'; }
@@ -1910,7 +2375,20 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
         badge.className = 'badge' + (info.count === 0 ? ' empty' : '');
       }
 
-      renderChips(el.querySelector('.chips'), info.lines);
+      var subStatus = el.querySelector('.sub-status-text');
+      if (subStatus && !subStatus.dataset.busy) {
+        var ago = formatAgo(info.lastSynced);
+        if (info.count > 0) {
+          subStatus.textContent = 'Synced ' + plural(info.count, 'config') + (ago ? ' \\u2022 ' + ago : '');
+          subStatus.className = 'sub-status-text ok';
+        } else {
+          subStatus.textContent = 'Auto-syncs when client apps update';
+          subStatus.className = 'sub-status-text';
+        }
+      }
+
+      var chipTags = renderChips(el.querySelector('.chips'), info.lines);
+      el.dataset.searchHaystack = cleanTitle + ' ' + info.mode + ' ' + chipTags.join(' ') + (info.enabled ? ' enabled active' : ' paused disabled');
 
       var dd = el.querySelector('.js-dedupe');
       dd.disabled = info.dupes === 0;
@@ -1926,26 +2404,31 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       }
 
       el.querySelector('.group-prefix-code').textContent = cleanTitle + ' - <IP>';
-      var rounds = Math.ceil(info.count / currentRotationChunk);
-      el.querySelector('.group-rounds-text').textContent = plural(rounds, 'batch', 'batches') + ' of up to ' + currentRotationChunk;
+      var rounds = info.enabled ? Math.ceil(info.count / currentRotationChunk) : 0;
+      el.querySelector('.group-rounds-text').textContent = info.enabled
+        ? (plural(rounds, 'batch', 'batches') + ' of up to ' + currentRotationChunk)
+        : 'Skipped in output while paused';
     });
 
     var batchCount = renderPreview(infos) || 0;
     $('statConfigs').textContent = totalConfigs;
-    $('statGroups').textContent = groupEls.length;
+    $('statGroups').textContent = activeGroupCount;
     $('statBatches').textContent = batchCount;
-    $('floatingTotalText').textContent = plural(totalConfigs, 'config') + ' in ' + plural(groupEls.length, 'group');
+    $('floatingTotalText').textContent = plural(totalConfigs, 'config') + ' in ' + plural(activeGroupCount, 'active group');
 
-    if (infos.length >= 2) {
+    var activeInfos = infos.filter(function (g) { return g.enabled; });
+    if (activeInfos.length >= 2) {
       $('rotationExample').innerHTML = '';
       $('rotationExample').appendChild(document.createTextNode('Example: '));
-      $('rotationExample').appendChild(h('b', { text: currentRotationChunk + ' from ' + display(infos[0].name) }));
+      $('rotationExample').appendChild(h('b', { text: currentRotationChunk + ' from ' + display(activeInfos[0].name) }));
       $('rotationExample').appendChild(document.createTextNode(', then '));
-      $('rotationExample').appendChild(h('b', { text: currentRotationChunk + ' from ' + display(infos[1].name) }));
-      $('rotationExample').appendChild(document.createTextNode(infos.length > 2 ? ', and so on.' : ', then back to ' + display(infos[0].name) + '.'));
+      $('rotationExample').appendChild(h('b', { text: currentRotationChunk + ' from ' + display(activeInfos[1].name) }));
+      $('rotationExample').appendChild(document.createTextNode(activeInfos.length > 2 ? ', and so on.' : ', then back to ' + display(activeInfos[0].name) + '.'));
     } else {
-      $('rotationExample').textContent = 'Add a second group to see how rotation works.';
+      $('rotationExample').textContent = 'Have at least two active groups to see how rotation interleaves them.';
     }
+
+    applyGroupFilter();
   }
 
   /* ---------- read the screen back into state ---------- */
@@ -1967,13 +2450,16 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       if (titleInput) titleInput.value = display(uniqueName);
 
       var mode = el.dataset.mode === 'sub' ? 'sub' : 'configs';
+      var enabled = el.dataset.enabled !== 'false';
       var cfgArea = el.querySelector('.configs-textarea');
       var subArea = el.querySelector('.sub-textarea');
       ordered[uniqueName] = {
         mode: mode,
+        enabled: enabled,
         configs: cfgArea ? parseLines(cfgArea.value) : prevEntry.configs,
         subUrls: subArea ? parseLines(subArea.value) : prevEntry.subUrls,
-        cachedSubConfigs: Array.isArray(el._cachedSubConfigs) ? el._cachedSubConfigs : prevEntry.cachedSubConfigs
+        cachedSubConfigs: Array.isArray(el._cachedSubConfigs) ? el._cachedSubConfigs : prevEntry.cachedSubConfigs,
+        lastSynced: Number(el._lastSynced) || prevEntry.lastSynced || 0
       };
     });
     dataGroups = ordered;
@@ -2001,28 +2487,55 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     }
     syncBtn.disabled = true;
     syncBtn.textContent = 'Syncing\\u2026';
+    statusEl.dataset.busy = '1';
     statusEl.textContent = 'Fetching configs\\u2026';
     statusEl.className = 'sub-status-text';
     try {
       var r = await postJson('/fetch-sub', { urls: urls });
       var data = r.data;
+      delete statusEl.dataset.busy;
       if (data && Array.isArray(data.configs) && data.configs.length > 0) {
         groupDiv._cachedSubConfigs = data.configs;
-        statusEl.textContent = 'Synced ' + plural(data.configs.length, 'config') + ' from ' + plural(urls.length, 'link');
-        statusEl.className = 'sub-status-text ok';
+        groupDiv._lastSynced = data.lastSynced || Date.now();
         syncFromDOM();
         updateAllCounts();
         markDirty(true);
+        showToast('Synced ' + plural(data.configs.length, 'config'), 'ok');
       } else {
         statusEl.textContent = (data && data.errors && data.errors.length > 0) ? data.errors[0] : (data && data.error ? data.error : 'No valid configs returned');
         statusEl.className = 'sub-status-text err';
       }
     } catch (e) {
+      delete statusEl.dataset.busy;
       statusEl.textContent = 'Could not reach that link.';
       statusEl.className = 'sub-status-text err';
     } finally {
       syncBtn.disabled = false;
       syncBtn.textContent = 'Sync now';
+    }
+  }
+
+  async function syncAllGroupsFromToolbar() {
+    syncFromDOM();
+    var groupEls = Array.from(document.querySelectorAll('.server-group')).filter(function (el) {
+      return el.dataset.mode === 'sub' && parseLines(el.querySelector('.sub-textarea').value).filter(isHttpLine).length > 0;
+    });
+    if (groupEls.length === 0) {
+      showToast('No groups in Subscription link mode have links to sync.', 'err');
+      return;
+    }
+    var btn = $('syncAllBtn');
+    btn.disabled = true;
+    btn.textContent = 'Syncing all\\u2026';
+    try {
+      await Promise.all(groupEls.map(function (el) {
+        var st = el.querySelector('.sub-status-text');
+        var sb = el.querySelector('.js-sync-sub');
+        return syncGroupSubLinks(el, st, sb);
+      }));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sync all links';
     }
   }
 
@@ -2127,11 +2640,16 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       var entry = ensureGroupObj(dataGroups[groupName]);
       dataGroups[groupName] = entry;
 
-      var groupDiv = h('div', { 'class': 'server-group' + (collapsed.has(groupName) ? ' collapsed' : ''), role: 'group', 'aria-label': display(groupName) });
+      var groupDiv = h('div', {
+        'class': 'server-group' + (collapsed.has(groupName) ? ' collapsed' : '') + (entry.enabled === false ? ' is-disabled' : ''),
+        role: 'group', 'aria-label': display(groupName)
+      });
       groupDiv.dataset.originalName = groupName;
       groupDiv.dataset.index = index;
       groupDiv.dataset.mode = entry.mode;
+      groupDiv.dataset.enabled = entry.enabled === false ? 'false' : 'true';
       groupDiv._cachedSubConfigs = entry.cachedSubConfigs;
+      groupDiv._lastSynced = entry.lastSynced || 0;
 
       /* header */
       var headerDiv = h('div', { 'class': 'group-header' });
@@ -2181,6 +2699,28 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       leftDiv.appendChild(countBadge);
 
       var rightDiv = h('div', { 'class': 'header-right' });
+
+      var enableBtn = h('button', {
+        type: 'button',
+        'class': 'enable-btn' + (entry.enabled === false ? ' off' : ''),
+        'aria-pressed': entry.enabled === false ? 'false' : 'true',
+        title: 'Include or pause this group in subscription output'
+      }, [
+        h('span', { 'class': 'state-dot', 'aria-hidden': 'true' }),
+        h('span', { 'class': 'enable-label', text: entry.enabled === false ? 'Paused' : 'Active' })
+      ]);
+      enableBtn.addEventListener('click', function () {
+        var nextOn = groupDiv.dataset.enabled === 'false';
+        groupDiv.dataset.enabled = nextOn ? 'true' : 'false';
+        groupDiv.classList.toggle('is-disabled', !nextOn);
+        enableBtn.classList.toggle('off', !nextOn);
+        enableBtn.setAttribute('aria-pressed', nextOn ? 'true' : 'false');
+        enableBtn.querySelector('.enable-label').textContent = nextOn ? 'Active' : 'Paused';
+        syncFromDOM();
+        updateAllCounts();
+        markDirty(true);
+      });
+
       var dedupBtn = h('button', { type: 'button', 'class': 'btn btn-ghost btn-sm js-dedupe', text: 'No duplicates', title: 'Remove repeated lines in this group' });
       dedupBtn.addEventListener('click', function () { deduplicateGroup(groupDiv); });
       var upBtn = h('button', { type: 'button', 'class': 'icon-btn', title: 'Move up', 'aria-label': 'Move ' + display(groupName) + ' up' }, [icon('up')]);
@@ -2191,7 +2731,7 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       downBtn.addEventListener('click', function () { moveGroup(index, 1); });
       var delBtn = h('button', { type: 'button', 'class': 'icon-btn danger', title: 'Delete group (you can undo)', 'aria-label': 'Delete ' + display(groupName) }, [icon('trash')]);
       delBtn.addEventListener('click', function () { deleteGroup(groupDiv.dataset.originalName); });
-      [dedupBtn, upBtn, downBtn, delBtn].forEach(function (b) { rightDiv.appendChild(b); });
+      [enableBtn, dedupBtn, upBtn, downBtn, delBtn].forEach(function (b) { rightDiv.appendChild(b); });
 
       headerDiv.appendChild(leftDiv);
       headerDiv.appendChild(rightDiv);
@@ -2204,26 +2744,21 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
       var subModeBtn = h('button', { type: 'button', 'class': 'mode-btn' + (entry.mode === 'sub' ? ' active sub-active' : ''), text: 'Subscription link', 'aria-pressed': entry.mode === 'sub' ? 'true' : 'false' });
       var switchGroup = h('div', { 'class': 'mode-switch-group', role: 'group', 'aria-label': 'Source type' }, [directModeBtn, subModeBtn]);
 
-      var subStatus = h('span', {
-        'class': 'sub-status-text' + (entry.cachedSubConfigs.length > 0 ? ' ok' : ''),
-        text: entry.cachedSubConfigs.length > 0 ? 'Synced ' + plural(entry.cachedSubConfigs.length, 'config') : 'Fetched live whenever apps update'
-      });
-      var syncSubBtn = h('button', { type: 'button', 'class': 'btn btn-ghost btn-sm', text: 'Sync now' });
+      var subStatus = h('span', { 'class': 'sub-status-text' });
+      var syncSubBtn = h('button', { type: 'button', 'class': 'btn btn-ghost btn-sm js-sync-sub', text: 'Sync now' });
       syncSubBtn.addEventListener('click', function () { syncGroupSubLinks(groupDiv, subStatus, syncSubBtn); });
       var subRight = h('div', { 'class': 'sub-actions-right' }, [subStatus, syncSubBtn]);
       subRight.hidden = entry.mode !== 'sub';
 
       var modeBar = h('div', { 'class': 'mode-bar' }, [switchGroup, subRight]);
 
-      var cfgArea = h('textarea', { 'class': 'configs-textarea', spellcheck: 'false', placeholder: 'Paste configs here, one per line\\u2026', 'aria-label': 'Configs for ' + display(groupName) });
+      var cfgArea = h('textarea', { 'class': 'configs-textarea', spellcheck: 'false', placeholder: 'Paste configs here, one per line (or paste a Base64 subscription payload to auto-decode)\\u2026', 'aria-label': 'Configs for ' + display(groupName) });
       cfgArea.value = entry.configs.join(NEWLINE);
       cfgArea.hidden = entry.mode !== 'configs';
-      cfgArea.addEventListener('input', function () { updateAllCounts(); markDirty(true); });
 
       var subArea = h('textarea', { 'class': 'sub-textarea', spellcheck: 'false', placeholder: 'Paste subscription link(s), one per line (https://\\u2026)', 'aria-label': 'Subscription links for ' + display(groupName) });
       subArea.value = entry.subUrls.join(NEWLINE);
       subArea.hidden = entry.mode !== 'sub';
-      subArea.addEventListener('input', function () { updateAllCounts(); markDirty(true); });
 
       function setMode(mode) {
         if (groupDiv.dataset.mode === mode) return;
@@ -2240,6 +2775,44 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
         updateAllCounts();
         markDirty(true);
       }
+
+      // Smart paste & input handling on Direct Configs
+      cfgArea.addEventListener('input', function () {
+        var rawLines = String(cfgArea.value || '').split(NEWLINE).map(function (l) { return l.trim(); }).filter(Boolean);
+        var changed = false;
+        var expanded = [];
+        var decodedCount = 0;
+        rawLines.forEach(function (l) {
+          var dec = tryDecodeBase64Block(l);
+          if (dec && dec.length > 0) {
+            changed = true;
+            decodedCount += dec.length;
+            dec.forEach(function (d) { expanded.push(d); });
+          } else {
+            expanded.push(l);
+          }
+        });
+        if (changed) {
+          cfgArea.value = expanded.join(NEWLINE);
+          showToast('Auto-decoded ' + plural(decodedCount, 'config') + ' from Base64', 'ok');
+        } else if (rawLines.length > 0 && rawLines.every(isHttpLine)) {
+          showToast('Looks like a subscription URL.', '', {
+            actionLabel: 'Switch to Subscription link',
+            duration: 6000,
+            onAction: function () {
+              subArea.value = rawLines.join(NEWLINE);
+              cfgArea.value = '';
+              setMode('sub');
+              syncGroupSubLinks(groupDiv, subStatus, syncSubBtn);
+            }
+          });
+        }
+        updateAllCounts();
+        markDirty(true);
+      });
+
+      subArea.addEventListener('input', function () { updateAllCounts(); markDirty(true); });
+
       directModeBtn.addEventListener('click', function () { setMode('configs'); });
       subModeBtn.addEventListener('click', function () { setMode('sub'); });
 
@@ -2337,11 +2910,10 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     dataGroups = rebuilt;
   }
 
-  // Insert a new empty group at a specific position (between two existing groups)
   function addGroupAt(position) {
     syncFromDOM();
     var uniqueId = 'New_Group_' + Math.floor(1000 + Math.random() * 9000);
-    insertGroupAt(uniqueId, { mode: 'configs', configs: [], subUrls: [], cachedSubConfigs: [] }, position);
+    insertGroupAt(uniqueId, { mode: 'configs', enabled: true, configs: [], subUrls: [], cachedSubConfigs: [], lastSynced: 0 }, position);
     markDirty(true);
     renderGroups();
     var els = document.querySelectorAll('.server-group');
@@ -2356,7 +2928,7 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
   function addNewGroup() {
     syncFromDOM();
     var uniqueId = 'New_Group_' + Math.floor(1000 + Math.random() * 9000);
-    dataGroups[uniqueId] = { mode: 'configs', configs: [], subUrls: [], cachedSubConfigs: [] };
+    dataGroups[uniqueId] = { mode: 'configs', enabled: true, configs: [], subUrls: [], cachedSubConfigs: [], lastSynced: 0 };
     markDirty(true);
     renderGroups();
     var els = document.querySelectorAll('.server-group');
@@ -2368,7 +2940,6 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     }
   }
 
-  // Deleting is instant but undoable, which is easier on people than a "are you sure?" popup.
   function deleteGroup(groupName) {
     syncFromDOM();
     var idx = Object.keys(dataGroups).indexOf(groupName);
@@ -2426,7 +2997,7 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
     try {
       var r = await postJson('/save', {
         groups: dataGroups, rotationChunk: currentRotationChunk, subTitle: currentSubTitle,
-        rev: currentRev, force: force === true
+        autoSync: currentAutoSync, rev: currentRev, force: force === true
       });
       if (r.data && r.data.success) {
         if (r.data.groups && typeof r.data.groups === 'object') dataGroups = r.data.groups;
@@ -2479,20 +3050,38 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
   /* ---------- wiring ---------- */
   $('addGroupTop').addEventListener('click', addNewGroup);
   $('addGroupList').addEventListener('click', addNewGroup);
+  $('syncAllBtn').addEventListener('click', syncAllGroupsFromToolbar);
   $('collapseAllBtn').addEventListener('click', function () { setAllCollapsed(true); });
   $('expandAllBtn').addEventListener('click', function () { setAllCollapsed(false); });
   $('copySubBtn').addEventListener('click', copySubLink);
+  $('qrSubBtn').addEventListener('click', showQrModal);
   $('regenTokenBtn').addEventListener('click', regenerateSubToken);
   $('upgradeLinkBtn').addEventListener('click', regenerateSubToken);
   $('toggleLinkBtn').addEventListener('click', function () { linkVisible = !linkVisible; renderLink(); });
   $('previewToggle').addEventListener('click', togglePreview);
+  $('colorsToggle').addEventListener('click', toggleColorsDrawer);
   $('saveAllBtn').addEventListener('click', function () { saveAll(false); });
   $('discardBtn').addEventListener('click', discardChanges);
   $('signOutBtn').addEventListener('click', signOut);
   $('subTitleInput').addEventListener('input', function (e) { currentSubTitle = String(e.target.value || ''); markDirty(true); });
   $('customChunkInput').addEventListener('input', function (e) { onCustomChunkInput(e.target.value); });
+
+  $('groupFilterInput').addEventListener('input', function (e) {
+    currentFilter = String(e.target.value || '');
+    applyGroupFilter();
+  });
+  $('clearFilterBtn').addEventListener('click', function () {
+    currentFilter = '';
+    $('groupFilterInput').value = '';
+    applyGroupFilter();
+    $('groupFilterInput').focus();
+  });
+
   document.querySelectorAll('.preset').forEach(function (b) {
     b.addEventListener('click', function () { setRotationChunk(b.getAttribute('data-chunk')); });
+  });
+  document.querySelectorAll('.sync-opt').forEach(function (b) {
+    b.addEventListener('click', function () { setAutoSync(b.getAttribute('data-sync')); });
   });
 
   var groupsContainerEl = $('groupsContainer');
@@ -2526,13 +3115,14 @@ dialog.dlg p { margin: 0 0 20px; font-size: 14px; line-height: 1.6; color: var(-
   });
 
   /* ---------- start ---------- */
-  var previewChev = icon('chev', 14);
-  $('previewChev').appendChild(previewChev);
+  $('previewChev').appendChild(icon('chev', 14));
+  $('colorsChev').appendChild(icon('chev', 14));
   $('subTitleInput').value = currentSubTitle;
   $('customChunkInput').value = currentRotationChunk;
   $('saveAllBtn').innerHTML = SAVE_LABEL;
   initColors();
   renderLink();
+  updateAutoSyncUI();
   updateChunkUI();
   renderGroups();
 })();
