@@ -4,7 +4,7 @@
 
 A single-file, zero-dependency **Cloudflare Worker** that lets you organize, group, rotate, and publish V2Ray / Xray / Clash proxy configurations and remote subscription links through a hardened, ergonomic web dashboard.
 
-![Subscription Hub Dashboard](screenshot.png)
+![Subscription Hub Dashboard](assets/interface-preview.png)
 
 ---
 
